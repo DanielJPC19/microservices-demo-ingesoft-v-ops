@@ -31,7 +31,6 @@ on:
         default: "prod"
         type: choice
         options:
-          - dev
           - staging
           - prod
 
