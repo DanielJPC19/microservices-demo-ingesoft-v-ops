@@ -8,9 +8,19 @@ variable "region" {
   default = "us-central1"
 }
 
-variable "docker_username" { type = string }
-variable "image_tag"       { type = string; default = "prod" }
-variable "db_password"     { type = string; sensitive = true }
+variable "docker_username" {
+  type = string
+}
+
+variable "image_tag" {
+  type    = string
+  default = "prod"
+}
+
+variable "db_password" {
+  type      = string
+  sensitive = true
+}
 
 terraform {
   required_version = ">= 1.6"
