@@ -1,21 +1,24 @@
 name: CD - Infrastructure (GCP / GKE)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Triggered by the dev repo (ci-main.yml) via workflow_dispatch after all
-# Docker images are pushed to Docker Hub.
+# Triggered by the dev repo (ci-main.yml / ci-release.yml) via workflow_dispatch
+# after Docker images are pushed to Docker Hub.
 #
-# This workflow provisions GKE clusters and deploys all services via Terraform.
+# Authentication: Workload Identity Federation (no long-lived JSON keys).
 #
 # Secrets required (Settings → Secrets → Actions):
-#   GOOGLE_CREDENTIALS  — GCP service account key JSON (with roles below)
-#   GCP_PROJECT_ID      — GCP project ID (e.g. my-project-123456)
-#   DOCKER_USERNAME     — Docker Hub username
-#   DB_PASSWORD         — PostgreSQL password
+#   WIF_PROVIDER    — Workload Identity Provider resource name
+#                     projects/PROJECT_NUMBER/locations/global/workloadIdentityPools/github-pool/providers/github-provider
+#   WIF_SA          — Service account email
+#                     tf-deployer@ingesoft-v.iam.gserviceaccount.com
+#   GCP_PROJECT_ID  — GCP project ID (e.g. ingesoft-v)
+#   DOCKER_USERNAME — Docker Hub username
+#   DB_PASSWORD     — PostgreSQL password
 #
-# Required GCP service account roles:
-#   - roles/container.admin       (create/manage GKE clusters)
-#   - roles/iam.serviceAccountUser (use service accounts for node pools)
-#   - roles/compute.viewer         (read network/compute resources)
+# Required service account roles:
+#   - roles/container.admin
+#   - roles/iam.serviceAccountUser
+#   - roles/compute.viewer
 # ─────────────────────────────────────────────────────────────────────────────
 
 on:
@@ -26,7 +29,7 @@ on:
         required: true
         default: "prod"
       environment:
-        description: "Target environment: dev | staging | prod"
+        description: "Target environment: staging | prod"
         required: true
         default: "prod"
         type: choice
@@ -39,6 +42,11 @@ jobs:
     name: Terraform Deploy (${{ github.event.inputs.environment }})
     runs-on: ubuntu-latest
 
+    # Required for Workload Identity Federation OIDC token request
+    permissions:
+      contents: read
+      id-token: write
+
     defaults:
       run:
         working-directory: infra/envs/${{ github.event.inputs.environment }}
@@ -50,10 +58,11 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Authenticate to Google Cloud
+      - name: Authenticate to Google Cloud (Workload Identity)
         uses: google-github-actions/auth@v2
         with:
-          credentials_json: ${{ secrets.GOOGLE_CREDENTIALS }}
+          workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
+          service_account: ${{ secrets.WIF_SA }}
 
       - name: Set up Terraform
         uses: hashicorp/setup-terraform@v3
@@ -62,8 +71,6 @@ jobs:
 
       - name: Terraform Init
         run: terraform init
-        env:
-          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
 
       - name: Terraform Validate
         run: terraform validate
@@ -73,7 +80,6 @@ jobs:
           terraform plan \
             -var="image_tag=${{ github.event.inputs.image_tag }}"
         env:
-          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
           TF_VAR_project_id:      ${{ secrets.GCP_PROJECT_ID }}
           TF_VAR_docker_username: ${{ secrets.DOCKER_USERNAME }}
           TF_VAR_db_password:     ${{ secrets.DB_PASSWORD }}
@@ -88,7 +94,6 @@ jobs:
           terraform apply -auto-approve \
             -var="image_tag=${{ github.event.inputs.image_tag }}"
         env:
-          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
           TF_VAR_project_id:      ${{ secrets.GCP_PROJECT_ID }}
           TF_VAR_docker_username: ${{ secrets.DOCKER_USERNAME }}
           TF_VAR_db_password:     ${{ secrets.DB_PASSWORD }}
@@ -96,7 +101,6 @@ jobs:
       - name: Show deployment outputs
         run: terraform output
         env:
-          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
           TF_VAR_project_id:      ${{ secrets.GCP_PROJECT_ID }}
           TF_VAR_docker_username: ${{ secrets.DOCKER_USERNAME }}
           TF_VAR_db_password:     ${{ secrets.DB_PASSWORD }}
