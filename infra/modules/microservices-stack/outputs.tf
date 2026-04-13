@@ -8,7 +8,7 @@ output "result_service_url" {
   value       = try("http://${kubernetes_service.result.status[0].load_balancer[0].ingress[0].ip}", "pending")
 }
 
-output "cluster_name" {
-  description = "GKE cluster name (use with gcloud to get credentials)"
+output "environment" {
+  description = "Deployment environment name"
   value       = var.environment
 }

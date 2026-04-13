@@ -32,7 +32,7 @@ resource "helm_release" "postgresql" {
   name       = "postgresql"
   repository = "https://charts.bitnami.com/bitnami"
   chart      = "postgresql"
-  version    = "~> 15.0"
+  version    = "~> 17.0"
   timeout    = 900
 
   set {
@@ -78,15 +78,11 @@ resource "helm_release" "kafka" {
   name       = "kafka"
   repository = "https://charts.bitnami.com/bitnami"
   chart      = "kafka"
-  version    = "~> 28.0"
+  version    = "~> 34.0"
   timeout    = 900
 
   set {
     name  = "listeners.client.protocol"
-    value = "PLAINTEXT"
-  }
-  set {
-    name  = "listeners.interbroker.protocol"
     value = "PLAINTEXT"
   }
   set {
