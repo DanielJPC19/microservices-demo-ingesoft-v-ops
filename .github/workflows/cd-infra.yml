@@ -1,17 +1,21 @@
-name: CD - Infrastructure (Simulated Infra Repo)
+name: CD - Infrastructure (GCP / GKE)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# In a real two-repo setup this workflow would live in the infrastructure
-# repository and be triggered via repository_dispatch from the dev repo.
+# Triggered by the dev repo (ci-main.yml) via workflow_dispatch after all
+# Docker images are pushed to Docker Hub.
 #
-# Here it is simulated within the same repo:
-#   - ci-main.yml calls workflow_dispatch on this file after all images are pushed.
-#   - This workflow runs Terraform from infra/envs/<environment>/.
+# This workflow provisions GKE clusters and deploys all services via Terraform.
 #
-# Secrets required (set in GitHub → Settings → Secrets):
-#   DOCKER_USERNAME   — Docker Hub user (used as TF_VAR_docker_username)
-#   DB_PASSWORD       — PostgreSQL password (used as TF_VAR_db_password)
-#   TF_API_TOKEN      — Terraform Cloud token (optional, for remote state)
+# Secrets required (Settings → Secrets → Actions):
+#   GOOGLE_CREDENTIALS  — GCP service account key JSON (with roles below)
+#   GCP_PROJECT_ID      — GCP project ID (e.g. my-project-123456)
+#   DOCKER_USERNAME     — Docker Hub username
+#   DB_PASSWORD         — PostgreSQL password
+#
+# Required GCP service account roles:
+#   - roles/container.admin       (create/manage GKE clusters)
+#   - roles/iam.serviceAccountUser (use service accounts for node pools)
+#   - roles/compute.viewer         (read network/compute resources)
 # ─────────────────────────────────────────────────────────────────────────────
 
 on:
@@ -47,50 +51,60 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GOOGLE_CREDENTIALS }}
+
       - name: Set up Terraform
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: "1.9.0"
-          # Uncomment to use Terraform Cloud for remote state:
-          # cli_config_credentials_token: ${{ secrets.TF_API_TOKEN }}
 
       - name: Terraform Init
         run: terraform init
+        env:
+          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
 
       - name: Terraform Validate
         run: terraform validate
 
       - name: Terraform Plan
-        run: terraform plan -var="image_tag=${{ github.event.inputs.image_tag }}"
+        run: |
+          terraform plan \
+            -var="image_tag=${{ github.event.inputs.image_tag }}"
         env:
+          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+          TF_VAR_project_id:      ${{ secrets.GCP_PROJECT_ID }}
           TF_VAR_docker_username: ${{ secrets.DOCKER_USERNAME }}
-          TF_VAR_db_password: ${{ secrets.DB_PASSWORD }}
+          TF_VAR_db_password:     ${{ secrets.DB_PASSWORD }}
 
       # ── Manual approval gate for prod ──────────────────────────────────────
-      # GitHub Environments with "required reviewers" enforces this.
-      # Configure in: Settings → Environments → prod → Required reviewers.
+      # Enforced by GitHub Environments with required reviewers.
+      # Configure: Settings → Environments → prod → Required reviewers.
       # ───────────────────────────────────────────────────────────────────────
 
       - name: Terraform Apply
-        run: terraform apply -auto-approve -var="image_tag=${{ github.event.inputs.image_tag }}"
+        run: |
+          terraform apply -auto-approve \
+            -var="image_tag=${{ github.event.inputs.image_tag }}"
         env:
+          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+          TF_VAR_project_id:      ${{ secrets.GCP_PROJECT_ID }}
           TF_VAR_docker_username: ${{ secrets.DOCKER_USERNAME }}
-          TF_VAR_db_password: ${{ secrets.DB_PASSWORD }}
+          TF_VAR_db_password:     ${{ secrets.DB_PASSWORD }}
 
       - name: Show deployment outputs
         run: terraform output
         env:
+          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+          TF_VAR_project_id:      ${{ secrets.GCP_PROJECT_ID }}
           TF_VAR_docker_username: ${{ secrets.DOCKER_USERNAME }}
-          TF_VAR_db_password: ${{ secrets.DB_PASSWORD }}
+          TF_VAR_db_password:     ${{ secrets.DB_PASSWORD }}
 
   # ─────────────────────────────────────────────────────────────────────────────
-  # Rollback instructions (not automated — operator action):
-  #
-  # 1. Find the last stable git SHA from Docker Hub or from a previous
-  #    successful run of ci-main.yml.
-  # 2. Manually trigger this workflow (workflow_dispatch) with:
-  #      image_tag: <previous-git-sha>
-  #      environment: prod
-  # 3. Terraform will replace running containers with the previous image version.
-  #    No code changes are needed in the dev repo.
+  # Rollback: trigger this workflow manually via workflow_dispatch with:
+  #   image_tag: <previous-git-sha>
+  #   environment: prod
+  # Terraform will update the Kubernetes Deployments to pull the previous image.
   # ─────────────────────────────────────────────────────────────────────────────

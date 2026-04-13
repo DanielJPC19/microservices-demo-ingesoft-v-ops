@@ -15,7 +15,7 @@ variable "image_tag" {
 }
 
 variable "db_password" {
-  description = "PostgreSQL password (inject from CI/CD secret, never hardcode)"
+  description = "PostgreSQL password (injected from CI/CD secret, never hardcoded)"
   type        = string
   sensitive   = true
 }
@@ -30,16 +30,4 @@ variable "db_name" {
   description = "PostgreSQL database name"
   type        = string
   default     = "votes"
-}
-
-variable "vote_port" {
-  description = "Host port to expose the vote service on"
-  type        = number
-  default     = 8080
-}
-
-variable "result_port" {
-  description = "Host port to expose the result service on"
-  type        = number
-  default     = 4000
 }

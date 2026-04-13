@@ -1,173 +1,245 @@
 terraform {
   required_providers {
-    docker = {
-      source  = "kreuzwerker/docker"
-      version = "~> 3.0"
+    helm = {
+      source  = "hashicorp/helm"
+      version = "~> 2.0"
+    }
+    kubernetes = {
+      source  = "hashicorp/kubernetes"
+      version = "~> 2.0"
     }
   }
 }
 
 # ─────────────────────────────────────────────
-# Shared network — all containers communicate
-# over this network by service name (DNS).
+# DB password — read by worker and result via
+# secretKeyRef in the deployment env blocks.
 # ─────────────────────────────────────────────
-resource "docker_network" "app_network" {
-  name = "votes-${var.environment}"
-}
-
-# ─────────────────────────────────────────────
-# PostgreSQL
-# ─────────────────────────────────────────────
-resource "docker_image" "postgresql" {
-  name         = "postgres:16"
-  keep_locally = true
-}
-
-resource "docker_container" "postgresql" {
-  name  = "postgresql-${var.environment}"
-  image = docker_image.postgresql.image_id
-
-  networks_advanced {
-    name    = docker_network.app_network.name
-    aliases = ["postgresql"]
+resource "kubernetes_secret" "db" {
+  metadata {
+    name = "db-secret"
   }
-
-  env = [
-    "POSTGRES_USER=${var.db_user}",
-    "POSTGRES_PASSWORD=${var.db_password}",
-    "POSTGRES_DB=${var.db_name}",
-  ]
-
-  healthcheck {
-    test     = ["CMD-SHELL", "pg_isready -U ${var.db_user}"]
-    interval = "10s"
-    timeout  = "5s"
-    retries  = 5
+  data = {
+    password = var.db_password
   }
-
-  restart = "unless-stopped"
 }
 
 # ─────────────────────────────────────────────
-# Apache Kafka (KRaft mode — no ZooKeeper)
+# PostgreSQL (Bitnami Helm chart)
+# Service DNS: postgresql:5432
 # ─────────────────────────────────────────────
-resource "docker_image" "kafka" {
-  name         = "apache/kafka:3.7.0"
-  keep_locally = true
+resource "helm_release" "postgresql" {
+  name       = "postgresql"
+  repository = "https://charts.bitnami.com/bitnami"
+  chart      = "postgresql"
+  version    = "~> 15.0"
+
+  set {
+    name  = "auth.username"
+    value = var.db_user
+  }
+  set_sensitive {
+    name  = "auth.password"
+    value = var.db_password
+  }
+  set {
+    name  = "auth.database"
+    value = var.db_name
+  }
+  set {
+    name  = "primary.persistence.size"
+    value = "5Gi"
+  }
 }
 
-resource "docker_container" "kafka" {
-  name  = "kafka-${var.environment}"
-  image = docker_image.kafka.image_id
+# ─────────────────────────────────────────────
+# Kafka (Bitnami Helm chart, KRaft mode)
+# Service DNS: kafka:9092
+# ─────────────────────────────────────────────
+resource "helm_release" "kafka" {
+  name       = "kafka"
+  repository = "https://charts.bitnami.com/bitnami"
+  chart      = "kafka"
+  version    = "~> 28.0"
 
-  networks_advanced {
-    name    = docker_network.app_network.name
-    aliases = ["kafka"]
+  set {
+    name  = "listeners.client.protocol"
+    value = "PLAINTEXT"
   }
-
-  env = [
-    "KAFKA_NODE_ID=1",
-    "KAFKA_PROCESS_ROLES=broker,controller",
-    "KAFKA_LISTENERS=PLAINTEXT://:9092,CONTROLLER://:9093",
-    "KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://kafka:9092",
-    "KAFKA_CONTROLLER_QUORUM_VOTERS=1@localhost:9093",
-    "KAFKA_CONTROLLER_LISTENER_NAMES=CONTROLLER",
-    "KAFKA_LISTENER_SECURITY_PROTOCOL_MAP=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT",
-    "KAFKA_AUTO_CREATE_TOPICS_ENABLE=true",
-  ]
-
-  restart = "unless-stopped"
+  set {
+    name  = "listeners.interbroker.protocol"
+    value = "PLAINTEXT"
+  }
+  set {
+    name  = "persistence.size"
+    value = "5Gi"
+  }
 }
 
 # ─────────────────────────────────────────────
 # Vote Service (Java / Spring Boot)
 # ─────────────────────────────────────────────
-resource "docker_image" "vote" {
-  name         = "${var.docker_username}/vote:${var.image_tag}"
-  keep_locally = false
+resource "kubernetes_deployment" "vote" {
+  metadata {
+    name   = "vote"
+    labels = { app = "vote" }
+  }
+  spec {
+    replicas = 1
+    selector { match_labels = { app = "vote" } }
+    template {
+      metadata { labels = { app = "vote" } }
+      spec {
+        container {
+          name  = "vote"
+          image = "${var.docker_username}/vote:${var.image_tag}"
+          port { container_port = 8080 }
+          env {
+            name  = "KAFKA_BOOTSTRAP_SERVERS"
+            value = "kafka:9092"
+          }
+          resources {
+            limits   = { cpu = "500m", memory = "512Mi" }
+            requests = { cpu = "100m", memory = "256Mi" }
+          }
+        }
+      }
+    }
+  }
+  depends_on = [helm_release.kafka]
 }
 
-resource "docker_container" "vote" {
-  name  = "vote-${var.environment}"
-  image = docker_image.vote.image_id
-
-  networks_advanced {
-    name    = docker_network.app_network.name
-    aliases = ["vote"]
+resource "kubernetes_service" "vote" {
+  metadata { name = "vote" }
+  spec {
+    selector = { app = "vote" }
+    port {
+      port        = 80
+      target_port = 8080
+    }
+    type = "LoadBalancer"
   }
-
-  ports {
-    internal = 8080
-    external = var.vote_port
-  }
-
-  env = [
-    "KAFKA_BOOTSTRAP_SERVERS=kafka:9092",
-  ]
-
-  depends_on = [docker_container.kafka]
-  restart    = "unless-stopped"
 }
 
 # ─────────────────────────────────────────────
 # Worker Service (Go)
 # ─────────────────────────────────────────────
-resource "docker_image" "worker" {
-  name         = "${var.docker_username}/worker:${var.image_tag}"
-  keep_locally = false
-}
-
-resource "docker_container" "worker" {
-  name  = "worker-${var.environment}"
-  image = docker_image.worker.image_id
-
-  networks_advanced {
-    name = docker_network.app_network.name
+resource "kubernetes_deployment" "worker" {
+  metadata {
+    name   = "worker"
+    labels = { app = "worker" }
   }
-
-  env = [
-    "DB_HOST=postgresql",
-    "DB_PORT=5432",
-    "DB_USER=${var.db_user}",
-    "DB_PASSWORD=${var.db_password}",
-    "DB_NAME=${var.db_name}",
-    "KAFKA_BROKERS=kafka:9092",
-  ]
-
-  depends_on = [docker_container.postgresql, docker_container.kafka]
-  restart    = "unless-stopped"
+  spec {
+    replicas = 1
+    selector { match_labels = { app = "worker" } }
+    template {
+      metadata { labels = { app = "worker" } }
+      spec {
+        container {
+          name  = "worker"
+          image = "${var.docker_username}/worker:${var.image_tag}"
+          env {
+            name  = "DB_HOST"
+            value = "postgresql"
+          }
+          env {
+            name  = "DB_PORT"
+            value = "5432"
+          }
+          env {
+            name  = "DB_USER"
+            value = var.db_user
+          }
+          env {
+            name = "DB_PASSWORD"
+            value_from {
+              secret_key_ref {
+                name = kubernetes_secret.db.metadata[0].name
+                key  = "password"
+              }
+            }
+          }
+          env {
+            name  = "DB_NAME"
+            value = var.db_name
+          }
+          env {
+            name  = "KAFKA_BROKERS"
+            value = "kafka:9092"
+          }
+          resources {
+            limits   = { cpu = "300m", memory = "256Mi" }
+            requests = { cpu = "50m", memory = "128Mi" }
+          }
+        }
+      }
+    }
+  }
+  depends_on = [helm_release.postgresql, helm_release.kafka]
 }
 
 # ─────────────────────────────────────────────
 # Result Service (Node.js)
 # ─────────────────────────────────────────────
-resource "docker_image" "result" {
-  name         = "${var.docker_username}/result:${var.image_tag}"
-  keep_locally = false
+resource "kubernetes_deployment" "result" {
+  metadata {
+    name   = "result"
+    labels = { app = "result" }
+  }
+  spec {
+    replicas = 1
+    selector { match_labels = { app = "result" } }
+    template {
+      metadata { labels = { app = "result" } }
+      spec {
+        container {
+          name  = "result"
+          image = "${var.docker_username}/result:${var.image_tag}"
+          port { container_port = 80 }
+          env {
+            name  = "DB_HOST"
+            value = "postgresql"
+          }
+          env {
+            name  = "DB_PORT"
+            value = "5432"
+          }
+          env {
+            name  = "DB_USER"
+            value = var.db_user
+          }
+          env {
+            name = "DB_PASSWORD"
+            value_from {
+              secret_key_ref {
+                name = kubernetes_secret.db.metadata[0].name
+                key  = "password"
+              }
+            }
+          }
+          env {
+            name  = "DB_NAME"
+            value = var.db_name
+          }
+          resources {
+            limits   = { cpu = "300m", memory = "256Mi" }
+            requests = { cpu = "50m", memory = "128Mi" }
+          }
+        }
+      }
+    }
+  }
+  depends_on = [helm_release.postgresql]
 }
 
-resource "docker_container" "result" {
-  name  = "result-${var.environment}"
-  image = docker_image.result.image_id
-
-  networks_advanced {
-    name    = docker_network.app_network.name
-    aliases = ["result"]
+resource "kubernetes_service" "result" {
+  metadata { name = "result" }
+  spec {
+    selector = { app = "result" }
+    port {
+      port        = 80
+      target_port = 80
+    }
+    type = "LoadBalancer"
   }
-
-  ports {
-    internal = 80
-    external = var.result_port
-  }
-
-  env = [
-    "DB_HOST=postgresql",
-    "DB_PORT=5432",
-    "DB_USER=${var.db_user}",
-    "DB_PASSWORD=${var.db_password}",
-    "DB_NAME=${var.db_name}",
-  ]
-
-  depends_on = [docker_container.postgresql]
-  restart    = "unless-stopped"
 }
