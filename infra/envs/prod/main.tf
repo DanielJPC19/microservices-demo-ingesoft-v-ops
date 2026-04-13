@@ -1,38 +1,16 @@
-# ─────────────────────────────────────────────
-# Variables
-# ─────────────────────────────────────────────
-
 variable "project_id" {
   type        = string
   description = "GCP project ID"
 }
 
 variable "region" {
-  type        = string
-  description = "GCP region"
-  default     = "us-central1"
+  type    = string
+  default = "us-central1"
 }
 
-variable "docker_username" {
-  type        = string
-  description = "Docker Hub username"
-}
-
-variable "image_tag" {
-  type        = string
-  description = "Docker image tag to deploy (git SHA for versioned deploys)"
-  default     = "prod"
-}
-
-variable "db_password" {
-  type        = string
-  sensitive   = true
-  description = "PostgreSQL password"
-}
-
-# ─────────────────────────────────────────────
-# Terraform & Provider Configuration
-# ─────────────────────────────────────────────
+variable "docker_username" { type = string }
+variable "image_tag"       { type = string; default = "prod" }
+variable "db_password"     { type = string; sensitive = true }
 
 terraform {
   required_version = ">= 1.6"
@@ -41,14 +19,6 @@ terraform {
     google = {
       source  = "hashicorp/google"
       version = "~> 5.0"
-    }
-    helm = {
-      source  = "hashicorp/helm"
-      version = "~> 2.0"
-    }
-    kubernetes = {
-      source  = "hashicorp/kubernetes"
-      version = "~> 2.0"
     }
   }
 
@@ -63,16 +33,9 @@ provider "google" {
   region  = var.region
 }
 
-data "google_client_config" "default" {}
-
-# ─────────────────────────────────────────────
-# GKE Cluster
-# ─────────────────────────────────────────────
-
 resource "google_container_cluster" "main" {
-  name     = "votes-prod"
-  location = var.region
-
+  name                     = "votes-prod"
+  location                 = var.region
   remove_default_node_pool = true
   initial_node_count       = 1
   deletion_protection      = false
@@ -91,56 +54,6 @@ resource "google_container_node_pool" "nodes" {
   }
 }
 
-# ─────────────────────────────────────────────
-# Helm & Kubernetes Providers (post-cluster)
-# ─────────────────────────────────────────────
-
-provider "helm" {
-  kubernetes {
-    host                   = "https://${google_container_cluster.main.endpoint}"
-    token                  = data.google_client_config.default.access_token
-    cluster_ca_certificate = base64decode(google_container_cluster.main.master_auth[0].cluster_ca_certificate)
-  }
-}
-
-provider "kubernetes" {
-  host                   = "https://${google_container_cluster.main.endpoint}"
-  token                  = data.google_client_config.default.access_token
-  cluster_ca_certificate = base64decode(google_container_cluster.main.master_auth[0].cluster_ca_certificate)
-}
-
-# ─────────────────────────────────────────────
-# Microservices Stack
-# ─────────────────────────────────────────────
-
-module "stack" {
-  source = "../../modules/microservices-stack"
-
-  environment     = "prod"
-  docker_username = var.docker_username
-  image_tag       = var.image_tag
-  db_password     = var.db_password
-  db_user         = "okteto"
-  db_name         = "votes"
-
-  depends_on = [google_container_node_pool.nodes]
-}
-
-# ─────────────────────────────────────────────
-# Outputs
-# ─────────────────────────────────────────────
-
-output "vote_url" {
-  description = "External URL for the vote service"
-  value       = module.stack.vote_service_url
-}
-
-output "result_url" {
-  description = "External URL for the result service"
-  value       = module.stack.result_service_url
-}
-
-output "environment" {
-  description = "Deployment environment name"
-  value       = module.stack.environment
+output "cluster_name" {
+  value = google_container_cluster.main.name
 }

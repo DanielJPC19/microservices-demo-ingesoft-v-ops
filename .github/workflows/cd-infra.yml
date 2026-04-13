@@ -1,26 +1,5 @@
 name: CD - Infrastructure (GCP / GKE)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Triggered by the dev repo (ci-main.yml / ci-release.yml) via workflow_dispatch
-# after Docker images are pushed to Docker Hub.
-#
-# Authentication: Workload Identity Federation (no long-lived JSON keys).
-#
-# Secrets required (Settings → Secrets → Actions):
-#   WIF_PROVIDER    — Workload Identity Provider resource name
-#                     projects/PROJECT_NUMBER/locations/global/workloadIdentityPools/github-pool/providers/github-provider
-#   WIF_SA          — Service account email
-#                     tf-deployer@ingesoft-v.iam.gserviceaccount.com
-#   GCP_PROJECT_ID  — GCP project ID (e.g. ingesoft-v)
-#   DOCKER_USERNAME — Docker Hub username
-#   DB_PASSWORD     — PostgreSQL password
-#
-# Required service account roles:
-#   - roles/container.admin
-#   - roles/iam.serviceAccountUser
-#   - roles/compute.viewer
-# ─────────────────────────────────────────────────────────────────────────────
-
 on:
   workflow_dispatch:
     inputs:
@@ -39,20 +18,19 @@ on:
 
 jobs:
   deploy:
-    name: Terraform Deploy (${{ github.event.inputs.environment }})
+    name: Deploy (${{ github.event.inputs.environment }})
     runs-on: ubuntu-latest
 
-    # Required for Workload Identity Federation OIDC token request
     permissions:
       contents: read
       id-token: write
 
-    defaults:
-      run:
-        working-directory: infra/envs/${{ github.event.inputs.environment }}
-
     environment:
       name: ${{ github.event.inputs.environment }}
+
+    env:
+      ENV: ${{ github.event.inputs.environment }}
+      IMAGE_TAG: ${{ github.event.inputs.image_tag }}
 
     steps:
       - name: Checkout repository
@@ -64,50 +42,332 @@ jobs:
           workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
           service_account: ${{ secrets.WIF_SA }}
 
+      - name: Set up gcloud + kubectl + auth plugin
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          install_components: "kubectl,gke-gcloud-auth-plugin"
+
       - name: Set up Terraform
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: "1.9.0"
 
+      # ── Terraform: only creates/manages the GKE cluster ──────────────────────
       - name: Terraform Init
+        working-directory: infra/envs/${{ env.ENV }}
         run: terraform init
 
+      - name: Remove stale Helm/K8s resources from Terraform state
+        working-directory: infra/envs/${{ env.ENV }}
+        run: |
+          terraform state list 2>/dev/null | grep -E "^module\." | while read -r r; do
+            echo "Removing stale state: $r"
+            terraform state rm "$r" || true
+          done
+        env:
+          TF_VAR_project_id:      ${{ secrets.GCP_PROJECT_ID }}
+          TF_VAR_docker_username: ${{ secrets.DOCKER_USERNAME }}
+          TF_VAR_db_password:     ${{ secrets.DB_PASSWORD }}
+
       - name: Terraform Validate
+        working-directory: infra/envs/${{ env.ENV }}
         run: terraform validate
 
-      - name: Terraform Plan
+      - name: Terraform Apply (GKE cluster only)
+        working-directory: infra/envs/${{ env.ENV }}
+        run: terraform apply -auto-approve -var="image_tag=${{ env.IMAGE_TAG }}"
+        env:
+          TF_VAR_project_id:      ${{ secrets.GCP_PROJECT_ID }}
+          TF_VAR_docker_username: ${{ secrets.DOCKER_USERNAME }}
+          TF_VAR_db_password:     ${{ secrets.DB_PASSWORD }}
+
+      # ── Connect to the cluster ────────────────────────────────────────────────
+      - name: Get GKE credentials
         run: |
-          terraform plan \
-            -var="image_tag=${{ github.event.inputs.image_tag }}"
-        env:
-          TF_VAR_project_id:      ${{ secrets.GCP_PROJECT_ID }}
-          TF_VAR_docker_username: ${{ secrets.DOCKER_USERNAME }}
-          TF_VAR_db_password:     ${{ secrets.DB_PASSWORD }}
+          gcloud container clusters get-credentials votes-${{ env.ENV }} \
+            --region us-central1 \
+            --project ${{ secrets.GCP_PROJECT_ID }}
 
-      # ── Manual approval gate for prod ──────────────────────────────────────
-      # Enforced by GitHub Environments with required reviewers.
-      # Configure: Settings → Environments → prod → Required reviewers.
-      # ───────────────────────────────────────────────────────────────────────
-
-      - name: Terraform Apply
+      # ── Deploy infrastructure (PostgreSQL + Kafka) via kubectl ────────────────
+      - name: Create DB secret
         run: |
-          terraform apply -auto-approve \
-            -var="image_tag=${{ github.event.inputs.image_tag }}"
-        env:
-          TF_VAR_project_id:      ${{ secrets.GCP_PROJECT_ID }}
-          TF_VAR_docker_username: ${{ secrets.DOCKER_USERNAME }}
-          TF_VAR_db_password:     ${{ secrets.DB_PASSWORD }}
+          kubectl create secret generic db-secret \
+            --from-literal=password=${{ secrets.DB_PASSWORD }} \
+            --dry-run=client -o yaml | kubectl apply -f -
 
-      - name: Show deployment outputs
-        run: terraform output
-        env:
-          TF_VAR_project_id:      ${{ secrets.GCP_PROJECT_ID }}
-          TF_VAR_docker_username: ${{ secrets.DOCKER_USERNAME }}
-          TF_VAR_db_password:     ${{ secrets.DB_PASSWORD }}
+      - name: Deploy PostgreSQL
+        run: |
+          kubectl apply -f - <<'EOF'
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: postgresql
+            labels:
+              app: postgresql
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: postgresql
+            template:
+              metadata:
+                labels:
+                  app: postgresql
+              spec:
+                containers:
+                - name: postgresql
+                  image: postgres:16
+                  ports:
+                  - containerPort: 5432
+                  env:
+                  - name: POSTGRES_USER
+                    value: appuser
+                  - name: POSTGRES_PASSWORD
+                    valueFrom:
+                      secretKeyRef:
+                        name: db-secret
+                        key: password
+                  - name: POSTGRES_DB
+                    value: votes
+                  resources:
+                    requests:
+                      cpu: "100m"
+                      memory: "256Mi"
+                    limits:
+                      cpu: "500m"
+                      memory: "512Mi"
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: postgresql
+          spec:
+            selector:
+              app: postgresql
+            ports:
+            - port: 5432
+              targetPort: 5432
+          EOF
 
-  # ─────────────────────────────────────────────────────────────────────────────
-  # Rollback: trigger this workflow manually via workflow_dispatch with:
-  #   image_tag: <previous-git-sha>
-  #   environment: prod
-  # Terraform will update the Kubernetes Deployments to pull the previous image.
-  # ─────────────────────────────────────────────────────────────────────────────
+      - name: Deploy Kafka
+        run: |
+          kubectl apply -f - <<'EOF'
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: kafka
+            labels:
+              app: kafka
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: kafka
+            template:
+              metadata:
+                labels:
+                  app: kafka
+              spec:
+                containers:
+                - name: kafka
+                  image: apache/kafka:3.7.0
+                  ports:
+                  - containerPort: 9092
+                  env:
+                  - name: KAFKA_NODE_ID
+                    value: "1"
+                  - name: KAFKA_PROCESS_ROLES
+                    value: broker,controller
+                  - name: KAFKA_LISTENERS
+                    value: PLAINTEXT://:9092,CONTROLLER://:9093
+                  - name: KAFKA_ADVERTISED_LISTENERS
+                    value: PLAINTEXT://kafka:9092
+                  - name: KAFKA_CONTROLLER_QUORUM_VOTERS
+                    value: 1@localhost:9093
+                  - name: KAFKA_CONTROLLER_LISTENER_NAMES
+                    value: CONTROLLER
+                  - name: KAFKA_LISTENER_SECURITY_PROTOCOL_MAP
+                    value: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+                  - name: KAFKA_AUTO_CREATE_TOPICS_ENABLE
+                    value: "true"
+                  resources:
+                    requests:
+                      cpu: "250m"
+                      memory: "512Mi"
+                    limits:
+                      cpu: "500m"
+                      memory: "1Gi"
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: kafka
+          spec:
+            selector:
+              app: kafka
+            ports:
+            - port: 9092
+              targetPort: 9092
+          EOF
+
+      # ── Deploy application services ───────────────────────────────────────────
+      - name: Deploy Vote, Worker, Result
+        env:
+          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+        run: |
+          kubectl apply -f - <<EOF
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: vote
+            labels:
+              app: vote
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: vote
+            template:
+              metadata:
+                labels:
+                  app: vote
+              spec:
+                containers:
+                - name: vote
+                  image: ${DOCKER_USERNAME}/vote:${IMAGE_TAG}
+                  ports:
+                  - containerPort: 8080
+                  env:
+                  - name: KAFKA_BOOTSTRAP_SERVERS
+                    value: kafka:9092
+                  resources:
+                    requests:
+                      cpu: "100m"
+                      memory: "256Mi"
+                    limits:
+                      cpu: "500m"
+                      memory: "512Mi"
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: vote
+          spec:
+            type: LoadBalancer
+            selector:
+              app: vote
+            ports:
+            - port: 80
+              targetPort: 8080
+          ---
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: worker
+            labels:
+              app: worker
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: worker
+            template:
+              metadata:
+                labels:
+                  app: worker
+              spec:
+                containers:
+                - name: worker
+                  image: ${DOCKER_USERNAME}/worker:${IMAGE_TAG}
+                  env:
+                  - name: DB_HOST
+                    value: postgresql
+                  - name: DB_PORT
+                    value: "5432"
+                  - name: DB_USER
+                    value: appuser
+                  - name: DB_PASSWORD
+                    valueFrom:
+                      secretKeyRef:
+                        name: db-secret
+                        key: password
+                  - name: DB_NAME
+                    value: votes
+                  - name: KAFKA_BROKERS
+                    value: kafka:9092
+                  resources:
+                    requests:
+                      cpu: "50m"
+                      memory: "128Mi"
+                    limits:
+                      cpu: "300m"
+                      memory: "256Mi"
+          ---
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: result
+            labels:
+              app: result
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: result
+            template:
+              metadata:
+                labels:
+                  app: result
+              spec:
+                containers:
+                - name: result
+                  image: ${DOCKER_USERNAME}/result:${IMAGE_TAG}
+                  ports:
+                  - containerPort: 80
+                  env:
+                  - name: DB_HOST
+                    value: postgresql
+                  - name: DB_PORT
+                    value: "5432"
+                  - name: DB_USER
+                    value: appuser
+                  - name: DB_PASSWORD
+                    valueFrom:
+                      secretKeyRef:
+                        name: db-secret
+                        key: password
+                  - name: DB_NAME
+                    value: votes
+                  resources:
+                    requests:
+                      cpu: "50m"
+                      memory: "128Mi"
+                    limits:
+                      cpu: "300m"
+                      memory: "256Mi"
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: result
+          spec:
+            type: LoadBalancer
+            selector:
+              app: result
+            ports:
+            - port: 80
+              targetPort: 80
+          EOF
+
+      # ── Show status ───────────────────────────────────────────────────────────
+      - name: Verify deployment
+        run: |
+          echo "=== Pods ==="
+          kubectl get pods -o wide
+          echo ""
+          echo "=== Services (LoadBalancer IPs may take 1-2 min) ==="
+          kubectl get services
+          echo ""
+          echo "Waiting for LoadBalancer IPs..."
+          sleep 30
+          kubectl get services vote result
