@@ -47,9 +47,26 @@ resource "helm_release" "postgresql" {
     name  = "auth.database"
     value = var.db_name
   }
+  # Disable persistence for demo — avoids PVC provisioning delays
   set {
-    name  = "primary.persistence.size"
-    value = "5Gi"
+    name  = "primary.persistence.enabled"
+    value = "false"
+  }
+  set {
+    name  = "primary.resources.requests.memory"
+    value = "256Mi"
+  }
+  set {
+    name  = "primary.resources.requests.cpu"
+    value = "100m"
+  }
+  set {
+    name  = "primary.resources.limits.memory"
+    value = "512Mi"
+  }
+  set {
+    name  = "primary.resources.limits.cpu"
+    value = "500m"
   }
 }
 
@@ -73,8 +90,29 @@ resource "helm_release" "kafka" {
     value = "PLAINTEXT"
   }
   set {
-    name  = "persistence.size"
-    value = "5Gi"
+    name  = "listeners.controller.protocol"
+    value = "PLAINTEXT"
+  }
+  # Disable persistence for demo — avoids PVC provisioning delays
+  set {
+    name  = "persistence.enabled"
+    value = "false"
+  }
+  set {
+    name  = "resources.requests.memory"
+    value = "512Mi"
+  }
+  set {
+    name  = "resources.requests.cpu"
+    value = "250m"
+  }
+  set {
+    name  = "resources.limits.memory"
+    value = "1Gi"
+  }
+  set {
+    name  = "resources.limits.cpu"
+    value = "500m"
   }
 }
 
