@@ -1,3 +1,39 @@
+# ─────────────────────────────────────────────
+# Variables
+# ─────────────────────────────────────────────
+
+variable "project_id" {
+  type        = string
+  description = "GCP project ID"
+}
+
+variable "region" {
+  type        = string
+  description = "GCP region"
+  default     = "us-central1"
+}
+
+variable "docker_username" {
+  type        = string
+  description = "Docker Hub username"
+}
+
+variable "image_tag" {
+  type        = string
+  description = "Docker image tag to deploy"
+  default     = "staging"
+}
+
+variable "db_password" {
+  type        = string
+  sensitive   = true
+  description = "PostgreSQL password"
+}
+
+# ─────────────────────────────────────────────
+# Terraform & Provider Configuration
+# ─────────────────────────────────────────────
+
 terraform {
   required_version = ">= 1.6"
 
@@ -29,6 +65,10 @@ provider "google" {
 
 data "google_client_config" "default" {}
 
+# ─────────────────────────────────────────────
+# GKE Cluster
+# ─────────────────────────────────────────────
+
 resource "google_container_cluster" "main" {
   name     = "votes-staging"
   location = var.region
@@ -51,6 +91,10 @@ resource "google_container_node_pool" "nodes" {
   }
 }
 
+# ─────────────────────────────────────────────
+# Helm & Kubernetes Providers (post-cluster)
+# ─────────────────────────────────────────────
+
 provider "helm" {
   kubernetes {
     host                   = "https://${google_container_cluster.main.endpoint}"
@@ -65,6 +109,10 @@ provider "kubernetes" {
   cluster_ca_certificate = base64decode(google_container_cluster.main.master_auth[0].cluster_ca_certificate)
 }
 
+# ─────────────────────────────────────────────
+# Microservices Stack
+# ─────────────────────────────────────────────
+
 module "stack" {
   source = "../../modules/microservices-stack"
 
@@ -72,35 +120,27 @@ module "stack" {
   docker_username = var.docker_username
   image_tag       = var.image_tag
   db_password     = var.db_password
+  db_user         = "okteto"
+  db_name         = "votes"
 
   depends_on = [google_container_node_pool.nodes]
 }
 
-variable "project_id" {
-  type        = string
-  description = "GCP project ID"
+# ─────────────────────────────────────────────
+# Outputs
+# ─────────────────────────────────────────────
+
+output "vote_url" {
+  description = "External URL for the vote service"
+  value       = module.stack.vote_service_url
 }
 
-variable "region" {
-  type        = string
-  description = "GCP region"
-  default     = "us-central1"
+output "result_url" {
+  description = "External URL for the result service"
+  value       = module.stack.result_service_url
 }
 
-variable "docker_username" {
-  type = string
+output "environment" {
+  description = "Deployment environment name"
+  value       = module.stack.environment
 }
-
-variable "image_tag" {
-  type    = string
-  default = "staging"
-}
-
-variable "db_password" {
-  type      = string
-  sensitive = true
-}
-
-output "vote_url"     { value = module.stack.vote_service_url }
-output "result_url"   { value = module.stack.result_service_url }
-output "cluster_name" { value = google_container_cluster.main.name }
