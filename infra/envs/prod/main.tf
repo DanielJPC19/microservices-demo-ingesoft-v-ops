@@ -16,10 +16,10 @@ terraform {
     }
   }
 
-  # backend "gcs" {
-  #   bucket = "your-tf-state-bucket"
-  #   prefix = "microservices-demo/prod"
-  # }
+  backend "gcs" {
+    bucket = "ingesoft-v-tfstate"
+    prefix = "microservices-demo/prod"
+  }
 }
 
 provider "google" {
